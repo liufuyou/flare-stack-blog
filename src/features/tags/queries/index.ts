@@ -1,60 +1,26 @@
-import { queryOptions } from "@tanstack/react-query";
-import {
-  getTagsAdminFn,
-  getTagsByPostIdFn,
-  getTagsFn,
-  getTagsWithCountAdminFn,
-} from "../api/tags.api";
+import { orpc } from "@/lib/orpc";
+import { emptyListOnNotFound } from "@/lib/orpc/null-on-not-found";
 import type { GetTagsInput } from "../tags.schema";
-import { apiClient } from "@/lib/api-client";
-import { isSSR } from "@/lib/utils";
 
-export const TAGS_KEYS = {
-  all: ["tags"] as const,
-
-  // Parent keys (static arrays for prefix invalidation)
-  public: ["tags", "public"] as const,
-  lists: ["tags", "list"] as const,
-  admin: ["tags", "admin"] as const,
-
-  // Child keys (functions for specific queries)
-  list: (filters: GetTagsInput) => ["tags", "list", filters] as const,
-  adminList: (filters: GetTagsInput) => ["tags", "admin", filters] as const,
-  adminWithCount: (filters: GetTagsInput) =>
-    ["tags", "admin", "with-count", filters] as const,
-  postTags: (postId: number) => ["post", postId, "tags"] as const,
-};
-
-export const tagsQueryOptions = queryOptions({
-  queryKey: TAGS_KEYS.public,
-  queryFn: async () => {
-    if (isSSR) {
-      return await getTagsFn();
-    }
-    const res = await apiClient.tags.$get();
-    if (!res.ok) throw new Error("Failed to fetch tags");
-    return res.json();
-  },
-});
+export const tagsQueryOptions = orpc.tags.list.queryOptions();
 
 export function tagsAdminQueryOptions(options: GetTagsInput = {}) {
-  return queryOptions({
-    queryKey: TAGS_KEYS.adminList(options),
-    queryFn: () => getTagsAdminFn({ data: options }),
+  return orpc.tags.admin.list.queryOptions({
+    input: options,
     staleTime: Infinity,
   });
 }
 
+/** Resolves to no tags for a post that does not exist (the server answers 404). */
 export function tagsByPostIdQueryOptions(postId: number) {
-  return queryOptions({
-    queryKey: TAGS_KEYS.postTags(postId),
-    queryFn: () => getTagsByPostIdFn({ data: { postId } }),
-  });
+  return emptyListOnNotFound(
+    orpc.tags.admin.byPostId.queryOptions({ input: { postId } }),
+    "POST_NOT_FOUND",
+  );
 }
 
 export function tagsWithCountAdminQueryOptions(options: GetTagsInput = {}) {
-  return queryOptions({
-    queryKey: TAGS_KEYS.adminWithCount(options),
-    queryFn: () => getTagsWithCountAdminFn({ data: options }),
+  return orpc.tags.admin.listWithCount.queryOptions({
+    input: { sortBy: "postCount", sortDir: "desc", ...options },
   });
 }

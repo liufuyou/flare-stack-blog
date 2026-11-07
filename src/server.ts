@@ -1,69 +1,79 @@
-import { handleEmailMessage } from "@/features/email/email.queue";
-import { app } from "@/lib/hono";
-import { queueMessageSchema } from "@/lib/queue/queue.schema";
+import { WorkerEntrypoint } from "cloudflare:workers";
+import handler from "@tanstack/react-start/server-entry";
+import { applyWorkersCachePurge } from "@/features/cache/workers-cache";
+import {
+  applyWorkersCachePolicy,
+  workersCacheKey,
+  type WorkersCachePurgeTarget,
+} from "@/features/cache/workers-cache-policy";
+import { postPopularityService } from "@/features/post-popularity/service/post-popularity.service";
+import { getDb } from "@/lib/db";
+import { isRoutedPath, probeNotFoundResponse } from "@/lib/probe-404";
+import { handleQueueBatch } from "@/lib/queue/queue.handler";
+import { extractLocaleFromRequest } from "@/paraglide/runtime";
+import { paraglideMiddleware } from "@/paraglide/server";
 
-export { CommentModerationWorkflow } from "@/features/comments/workflows/comment-moderation";
-export { ExportWorkflow } from "@/features/import-export/workflows/export.workflow";
-export { ImportWorkflow } from "@/features/import-export/workflows/import.workflow";
-export { PostProcessWorkflow } from "@/features/posts/workflows/post-process";
-export { ScheduledPublishWorkflow } from "@/features/posts/workflows/scheduled-publish";
+export { PostPublisher } from "@/lib/do/post-publisher";
 export { RateLimiter } from "@/lib/do/rate-limiter";
-export { PasswordHasher } from "@/lib/do/password-hasher";
 
 declare module "@tanstack/react-start" {
   interface Register {
     server: {
       requestContext: {
         env: Env;
-        executionCtx: ExecutionContext;
+        executionCtx: ExecutionContext<unknown>;
       };
     };
   }
 }
 
-export default {
-  fetch(request, env, ctx) {
-    return app.fetch(request, env, ctx);
-  },
-  async queue(batch, env) {
-    for (const message of batch.messages) {
-      const parsed = queueMessageSchema.safeParse(message.body);
-      if (!parsed.success) {
-        console.error(
-          JSON.stringify({
-            message: "queue invalid message",
-            body: message.body,
-            error: parsed.error.message,
-          }),
-        );
-        message.ack();
-        continue;
-      }
+type AppProps = {
+  locale: string;
+};
 
-      try {
-        const event = parsed.data;
-        switch (event.type) {
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-          case "EMAIL":
-            await handleEmailMessage(env, {
-              ...event.data,
-              idempotencyKey: message.id,
-            });
-            break;
-          default:
-            event.type satisfies never;
-        }
-        message.ack();
-      } catch (error) {
-        console.error(
-          JSON.stringify({
-            message: "queue processing failed",
-            attempt: message.attempts,
-            error: error instanceof Error ? error.message : "unknown error",
-          }),
-        );
-        message.retry();
-      }
+export class App extends WorkerEntrypoint<Env, AppProps> {
+  async fetch(request: Request) {
+    const response = await paraglideMiddleware(request, () =>
+      handler.fetch(request, {
+        context: {
+          env: this.env,
+          executionCtx: this.ctx,
+        },
+      }),
+    );
+    return applyWorkersCachePolicy(request, response);
+  }
+
+  async purgeCache(target: WorkersCachePurgeTarget) {
+    const { cache } = await import("cloudflare:workers");
+    await applyWorkersCachePurge(this.ctx.cache ?? cache, target);
+  }
+}
+
+export default {
+  async fetch(request, _env, ctx) {
+    // Scanner probes would each cost an SSR render, so answer them here.
+    if (!isRoutedPath(new URL(request.url).pathname)) {
+      return probeNotFoundResponse(request);
     }
+    const locale = extractLocaleFromRequest(request);
+    return ctx.exports.App({ props: { locale } }).fetch(request, {
+      // Cached pages name the hashed assets of the build that rendered them,
+      // and a deploy removes those assets, so each build gets its own keys.
+      cf: {
+        cacheKey: `/_build/${__BUILD_ID__}${workersCacheKey(request.url)}`,
+      },
+    });
+  },
+  async queue(batch, env, ctx) {
+    await handleQueueBatch(batch, env, ctx);
+  },
+  async scheduled(_controller, env, ctx) {
+    const result = await postPopularityService.sync({
+      env,
+      db: getDb(env),
+      executionCtx: ctx,
+    });
+    if (result.error) throw new Error("Post popularity sync failed");
   },
 } satisfies ExportedHandler<Env>;

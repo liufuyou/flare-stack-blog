@@ -1,4 +1,9 @@
-import { z } from "zod";
+import { invalidate } from "@/features/cache/public-cache";
+import * as PostRepo from "@/features/posts/data/posts.data";
+import * as SearchService from "@/features/search/service/search.service";
+
+import * as TagRepo from "@/features/tags/data/tags.data";
+import { publicTagList } from "@/features/tags/tags.cache";
 import type {
   CreateTagInput,
   DeleteTagInput,
@@ -9,16 +14,8 @@ import type {
   TagWithCount,
   UpdateTagInput,
 } from "@/features/tags/tags.schema";
-
-import {
-  TAGS_CACHE_KEYS,
-  TagWithCountSchema,
-} from "@/features/tags/tags.schema";
-import { POSTS_CACHE_KEYS } from "@/features/posts/posts.schema";
-import * as TagRepo from "@/features/tags/data/tags.data";
-import * as CacheService from "@/features/cache/cache.service";
-import { purgeCDNCache } from "@/lib/invalidate";
-import { err, ok } from "@/lib/error";
+import { isUniqueViolation, TAG_NAME } from "@/lib/db/unique-keys";
+import { err, ok } from "@/lib/errors";
 
 /**
  * Get all tags (cached)
@@ -56,19 +53,7 @@ export async function getPublicTags(
     executionCtx: ExecutionContext;
   },
 ) {
-  return await CacheService.get(
-    context,
-    TAGS_CACHE_KEYS.publicList,
-    z.array(TagWithCountSchema),
-    async () => {
-      return await TagRepo.getAllTagsWithCount(context.db, {
-        publicOnly: true,
-        sortBy: "postCount",
-        sortDir: "desc",
-      });
-    },
-    { ttl: "7d" },
-  );
+  return publicTagList.get(context, {});
 }
 
 /**
@@ -79,17 +64,31 @@ export async function getTagsWithCount(
   data: GetTagsInput = {},
 ) {
   // We don't cache this for now as it's for admin management
-  return await TagRepo.getAllTagsWithCount(context.db, data);
+  const [items, publicItems] = await Promise.all([
+    TagRepo.getAllTagsWithCount(context.db, data),
+    TagRepo.getAllTagsWithCount(context.db, { publicOnly: true }),
+  ]);
+  const publicCounts = new Map(
+    publicItems.map((item) => [item.id, item.postCount]),
+  );
+  return items.map((item) => ({
+    ...item,
+    publicPostCount: publicCounts.get(item.id) ?? 0,
+  }));
 }
 
 /**
- * Get tags for a specific post
+ * Get tags for a specific post, or POST_NOT_FOUND when there is no such post:
+ * a missing post has no tags to list, which is not the same as having none.
  */
 export async function getTagsByPostId(
   context: DbContext,
   data: GetTagsByPostIdInput,
 ) {
-  return await TagRepo.getTagsByPostId(context.db, data.postId);
+  if ((await PostRepo.findPostSaveToken(context.db, data.postId)) === null) {
+    return err({ reason: "POST_NOT_FOUND" });
+  }
+  return ok(await TagRepo.getTagsByPostId(context.db, data.postId));
 }
 
 // ============ Admin Service Methods ============
@@ -98,68 +97,30 @@ export async function getTagsByPostId(
  * Create a new tag
  */
 
-/**
- * Helper to invalidate caches related to tags and their associated posts.
- *
- * 采用保守策略：
- * 1. 无论如何都清除 publicList（标签变动必然影响标签云）
- * 2. 如果有受影响的文章，精确失效这些文章的缓存
- * 3. 如果没有受影响的文章（可能是 DB/KV 不同步），bump 所有版本号
- */
 async function invalidateTagRelatedCache(
-  context: DbContext,
+  context: DbContext & { executionCtx: ExecutionContext },
   affectedPosts: Array<{ id: number; slug: string }>,
 ) {
-  // 1. 无论如何都清除 publicList
-  await CacheService.deleteKey(context, TAGS_CACHE_KEYS.publicList);
-
-  if (affectedPosts.length > 0) {
-    // 2. 精确失效受影响的文章
-    const tasks: Array<Promise<void>> = [];
-
-    // Bump post list version
-    tasks.push(CacheService.bumpVersion(context, "posts:list"));
-
-    // Invalidate each affected post's detail cache
-    const version = await CacheService.getVersion(context, "posts:detail");
-    for (const post of affectedPosts) {
-      tasks.push(
-        CacheService.deleteKey(
-          context,
-          POSTS_CACHE_KEYS.detail(version, post.slug),
-        ),
-      );
-    }
-
-    // Purge CDN for affected posts and list pages
-    const cdnUrls = ["/", "/posts"];
-    for (const post of affectedPosts) {
-      cdnUrls.push(`/post/${post.slug}`);
-    }
-    tasks.push(purgeCDNCache(context.env, { urls: cdnUrls }));
-
-    await Promise.all(tasks);
-  } else {
-    // 3. 保守策略：可能是 DB/KV 不同步，bump 所有版本号
-    await Promise.all([
-      CacheService.bumpVersion(context, "posts:detail"),
-      CacheService.bumpVersion(context, "posts:list"),
-      purgeCDNCache(context.env, { urls: ["/", "/posts"] }),
-    ]);
-  }
+  await invalidate.tagChanged(context, {
+    slugs: affectedPosts.map((post) => post.slug),
+  });
 }
 
 export const createTag = async (context: DbContext, data: CreateTagInput) => {
   const exists = await TagRepo.nameExists(context.db, data.name);
   if (exists) {
-    return err({ reason: "TAG_NAME_ALREADY_EXISTS" as const });
+    return err({ reason: "TAG_NAME_ALREADY_EXISTS" });
   }
 
-  const tag = await TagRepo.insertTag(context.db, {
-    name: data.name,
-  });
-
-  return ok(tag);
+  try {
+    return ok(await TagRepo.insertTag(context.db, { name: data.name }));
+  } catch (error) {
+    // A concurrent create or rename took the name after the check.
+    if (isUniqueViolation(error, TAG_NAME)) {
+      return err({ reason: "TAG_NAME_ALREADY_EXISTS" });
+    }
+    throw error;
+  }
 };
 
 /**
@@ -171,7 +132,7 @@ export async function updateTag(
 ) {
   const existingTag = await TagRepo.findTagById(context.db, data.id);
   if (!existingTag) {
-    return err({ reason: "TAG_NOT_FOUND" as const });
+    return err({ reason: "TAG_NOT_FOUND" });
   }
 
   if (data.data.name && data.data.name !== existingTag.name) {
@@ -179,7 +140,7 @@ export async function updateTag(
       excludeId: data.id,
     });
     if (exists) {
-      return err({ reason: "TAG_NAME_ALREADY_EXISTS" as const });
+      return err({ reason: "TAG_NAME_ALREADY_EXISTS" });
     }
   }
 
@@ -188,7 +149,24 @@ export async function updateTag(
     data.id,
   );
 
-  const tag = await TagRepo.updateTag(context.db, data.id, data.data);
+  let tag;
+  try {
+    tag = await TagRepo.updateTag(context.db, data.id, data.data);
+  } catch (error) {
+    // A concurrent create or rename took the name after the check.
+    if (isUniqueViolation(error, TAG_NAME)) {
+      return err({ reason: "TAG_NAME_ALREADY_EXISTS" });
+    }
+    throw error;
+  }
+
+  // The new name is public at once, so search follows (not left to a rebuild).
+  if (data.data.name && data.data.name !== existingTag.name) {
+    await SearchService.reindexPosts(
+      context,
+      affectedPosts.map((post) => post.id),
+    );
+  }
 
   context.executionCtx.waitUntil(
     invalidateTagRelatedCache(context, affectedPosts),
@@ -205,7 +183,9 @@ export async function deleteTag(
   data: DeleteTagInput,
 ) {
   const tag = await TagRepo.findTagById(context.db, data.id);
-  if (!tag) return;
+  if (!tag) {
+    return err({ reason: "TAG_NOT_FOUND" });
+  }
 
   // Fetch published posts associated with this tag BEFORE deleting
   const affectedPosts = await TagRepo.getPublishedPostsByTagId(
@@ -214,18 +194,57 @@ export async function deleteTag(
   );
 
   await TagRepo.deleteTag(context.db, data.id);
+  await SearchService.reindexPosts(
+    context,
+    affectedPosts.map((post) => post.id),
+  );
 
   context.executionCtx.waitUntil(
     invalidateTagRelatedCache(context, affectedPosts),
   );
+
+  return ok({ success: true });
 }
 
 /**
- * Set tags for a post (edit only, no cache invalidation)
- *
- * 编辑页面改标签只影响 DB，不触发 KV 变化。
- * KV 只在"发布"时刷新。
+ * Replaces the Post's draft Tags. The public site keeps the Tags of its Public
+ * Content Snapshot until the Post is published (ADR 0033), so no public cache
+ * needs purging. Returns the Post's new saveToken, or POST_NOT_FOUND when there
+ * is no such Post, or TAG_NOT_FOUND when a Tag id has no Tag. With a stated
+ * saveToken the Post was saved since, nothing is written, and the current token
+ * comes back as an Edit Conflict (ADR 0031).
  */
 export async function setPostTags(context: DbContext, data: SetPostTagsInput) {
-  await TagRepo.setPostTags(context.db, data.postId, data.tagIds);
+  // Setting the Tags the Post already has writes nothing, so it keeps the
+  // saveToken an open editor holds. A stated token still has to be current.
+  const held = await PostRepo.findPostSaveToken(context.db, data.postId);
+  if (held !== null) {
+    const tags = await TagRepo.getTagsByPostId(context.db, data.postId);
+    const wanted = new Set(data.tagIds);
+    if (
+      tags.length === wanted.size &&
+      tags.every((tag) => wanted.has(tag.id))
+    ) {
+      if (data.saveToken !== undefined && data.saveToken !== held) {
+        return err({ reason: "EDIT_CONFLICT", saveToken: held });
+      }
+      return ok({ saveToken: held });
+    }
+  }
+
+  const saveToken = await TagRepo.setPostTags(
+    context.db,
+    data.postId,
+    data.tagIds,
+    { saveToken: data.saveToken },
+  );
+  if (saveToken !== null) return ok({ saveToken });
+
+  // Nothing was written: the Post is missing, a Tag is missing, or a newer
+  // save replaced the stated token.
+  const current = await PostRepo.findPostSaveToken(context.db, data.postId);
+  if (current === null) return err({ reason: "POST_NOT_FOUND" });
+  const missing = await TagRepo.findMissingTagIds(context.db, data.tagIds);
+  if (missing.length > 0) return err({ reason: "TAG_NOT_FOUND" });
+  return err({ reason: "EDIT_CONFLICT", saveToken: current });
 }

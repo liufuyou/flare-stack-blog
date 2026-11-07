@@ -5,135 +5,210 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { z } from "zod";
+import { resetAuthBoundQueries } from "@/features/auth/queries";
 import { usePreviousLocation } from "@/hooks/use-previous-location";
-import { authClient } from "@/lib/auth/auth.client";
-import { AUTH_KEYS } from "@/features/auth/queries";
+import { getAuthClient } from "@/lib/auth/auth-client";
+import {
+  getRetryAfterMs,
+  getSignInCodeAuthErrorMessage,
+  isSignInCodeSpentError,
+} from "@/lib/auth/auth-errors";
+import type { Messages } from "@/lib/i18n";
+import { m } from "@/paraglide/messages";
+import {
+  getResendCooldownMs,
+  isSignInCode,
+  normalizeSignInCode,
+} from "../utils/sign-in-code";
+import { normalizeRedirectUrl } from "./normalize-redirect-url";
+import { useCooldown } from "./use-cooldown";
 
-const loginSchema = z.object({
-  email: z.email("无效的邮箱格式"),
-  password: z.string().min(1, "请输入密码"),
-});
+export type LoginStep = "email" | "code" | "name";
 
-type LoginSchema = z.infer<typeof loginSchema>;
+const createEmailSchema = (messages: Messages) =>
+  z.object({
+    email: z.email(messages.login_validation_invalid_email()),
+  });
 
-export interface UseLoginFormOptions {
+const createCodeSchema = (messages: Messages) =>
+  z.object({
+    code: z.string().refine(isSignInCode, messages.login_validation_code()),
+  });
+
+type EmailSchema = z.infer<ReturnType<typeof createEmailSchema>>;
+type CodeSchema = z.infer<ReturnType<typeof createCodeSchema>>;
+
+interface UseLoginFormOptions {
   turnstileToken: string | null;
-  turnstilePending: boolean;
   resetTurnstile: () => void;
   redirectTo?: string;
 }
 
 export function useLoginForm(options: UseLoginFormOptions) {
-  const { turnstileToken, turnstilePending, resetTurnstile, redirectTo } =
-    options;
+  const { turnstileToken, resetTurnstile, redirectTo } = options;
 
-  const [loginStep, setLoginStep] = useState<"IDLE" | "VERIFYING" | "SUCCESS">(
-    "IDLE",
-  );
-  const [isUnverifiedEmail, setIsUnverifiedEmail] = useState(false);
-
+  const [step, setStep] = useState<LoginStep>("email");
+  const [email, setEmail] = useState("");
+  const [signedIn, setSignedIn] = useState(false);
+  const [isResending, setIsResending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const cooldown = useCooldown();
   const navigate = useNavigate();
   const previousLocation = usePreviousLocation();
   const queryClient = useQueryClient();
 
-  const form = useForm<LoginSchema>({
-    resolver: standardSchemaResolver(loginSchema),
+  const emailForm = useForm<EmailSchema>({
+    resolver: standardSchemaResolver(createEmailSchema(m)),
+  });
+  const codeForm = useForm<CodeSchema>({
+    resolver: standardSchemaResolver(createCodeSchema(m)),
   });
 
-  const emailValue = form.watch("email");
+  const performRedirect = (
+    redirectTarget: string | undefined,
+    fallback: string,
+  ) => {
+    const target = normalizeRedirectUrl(redirectTarget, fallback);
 
-  const onSubmit = async (data: LoginSchema) => {
-    setLoginStep("VERIFYING");
-    setIsUnverifiedEmail(false);
-
-    const { error } = await authClient.signIn.email({
-      email: data.email,
-      password: data.password,
-      fetchOptions: {
-        headers: { "X-Turnstile-Token": turnstileToken || "" },
-      },
-    });
-
-    resetTurnstile();
-
-    if (error) {
-      setLoginStep("IDLE");
-
-      switch (error.code as keyof typeof authClient.$ERROR_CODES | undefined) {
-        case "EMAIL_NOT_VERIFIED":
-          form.setError("root", { message: "邮箱尚未验证" });
-          setIsUnverifiedEmail(true);
-          break;
-        case "INVALID_EMAIL_OR_PASSWORD":
-          form.setError("root", { message: "无效的账号或密码" });
-          break;
-        default:
-          if (error.message?.includes("Turnstile")) {
-            form.setError("root", {
-              message: "人机验证失败，请等待验证完成后重试",
-            });
-          } else {
-            form.setError("root", { message: error.message || "登录失败" });
-          }
-      }
-
-      toast.error("登录失败", { description: error.message });
+    if (target.startsWith("/api/")) {
+      window.location.assign(target);
       return;
     }
 
-    queryClient.removeQueries({ queryKey: AUTH_KEYS.session });
-    setLoginStep("SUCCESS");
+    if (target.startsWith(window.location.origin)) {
+      const url = new URL(target);
+      void navigate({ to: `${url.pathname}${url.search}${url.hash}` });
+      return;
+    }
 
+    window.location.assign(target);
+  };
+
+  const finish = () => {
+    setSignedIn(true);
+    resetAuthBoundQueries(queryClient);
     setTimeout(() => {
-      navigate({ to: redirectTo ?? previousLocation });
-      toast.success("欢迎回来");
+      performRedirect(redirectTo, previousLocation);
+      toast.success(m.login_toast_success());
     }, 800);
   };
 
-  const handleResendVerification = async () => {
-    if (!emailValue) return;
-    if (turnstilePending) {
-      toast.error("请等待人机验证完成");
-      return;
-    }
-
-    const loadingToast = toast.loading("正在发送验证邮件...");
-
-    const { error } = await authClient.sendVerificationEmail({
-      email: emailValue,
-      callbackURL: `${window.location.origin}/verify-email`,
-      fetchOptions: {
-        headers: { "X-Turnstile-Token": turnstileToken || "" },
-      },
-    });
-
-    resetTurnstile();
-    toast.dismiss(loadingToast);
-
-    if (error) {
-      if (error.message?.includes("Turnstile")) {
-        toast.error("人机验证失败", { description: "请等待验证完成后重试" });
-      } else {
-        toast.error("发送失败，请稍后重试", { description: error.message });
+  /** Emails a code and moves to the code step; false when it was refused. */
+  const requestCode = async (address: string) => {
+    setError(null);
+    try {
+      const { error: sendError } =
+        await getAuthClient().emailOtp.sendVerificationOtp({
+          email: address,
+          type: "sign-in",
+          fetchOptions: {
+            headers: { "X-Turnstile-Token": turnstileToken || "" },
+          },
+        });
+      if (sendError) {
+        setError(
+          getSignInCodeAuthErrorMessage(sendError, m) ??
+            m.auth_error_default_desc(),
+        );
+        const retryAfterMs = getRetryAfterMs(sendError);
+        if (retryAfterMs && step === "code") {
+          cooldown.start(getResendCooldownMs(retryAfterMs));
+        }
+        return false;
       }
+    } catch {
+      setError(m.auth_error_default_desc());
+      return false;
+    } finally {
+      resetTurnstile();
+    }
+
+    setEmail(address);
+    cooldown.start(getResendCooldownMs());
+    return true;
+  };
+
+  const onSubmitEmail = async (data: EmailSchema) => {
+    if (!(await requestCode(data.email))) return;
+    codeForm.reset();
+    setStep("code");
+  };
+
+  const onSubmitCode = async (data: CodeSchema) => {
+    setError(null);
+    try {
+      const { data: result, error: signInError } =
+        await getAuthClient().signIn.emailOtp({
+          email,
+          otp: normalizeSignInCode(data.code),
+        });
+      if (signInError) {
+        codeForm.reset();
+        if (isSignInCodeSpentError(signInError)) {
+          cooldown.clear();
+          setStep("email");
+        }
+        setError(
+          getSignInCodeAuthErrorMessage(signInError, m) ??
+            m.auth_error_default_desc(),
+        );
+        return;
+      }
+      if (!result.user.name.trim()) {
+        setStep("name");
+        return;
+      }
+    } catch {
+      setError(m.auth_error_default_desc());
       return;
     }
 
-    toast.success("验证邮件已发送", { description: "请检查您的收件箱" });
+    finish();
+  };
+
+  const resend = async () => {
+    if (isResending || cooldown.secondsLeft > 0) return;
+    setIsResending(true);
+    try {
+      if (await requestCode(email)) {
+        codeForm.reset();
+        toast.success(m.login_code_resent());
+      }
+    } finally {
+      setIsResending(false);
+    }
+  };
+
+  const changeEmail = () => {
+    codeForm.reset();
+    cooldown.clear();
+    setError(null);
+    setStep("email");
   };
 
   return {
-    register: form.register,
-    errors: form.formState.errors,
-    handleSubmit: form.handleSubmit(onSubmit),
-    loginStep,
-    isSubmitting: form.formState.isSubmitting,
-    isUnverifiedEmail,
-    rootError: form.formState.errors.root?.message,
-    handleResendVerification,
-    emailValue,
-    loginSchema,
+    step,
+    email,
+    error,
+    signedIn,
+    isResending,
+    resendSecondsLeft: cooldown.secondsLeft,
+    emailForm: {
+      register: emailForm.register,
+      errors: emailForm.formState.errors,
+    },
+    codeForm: {
+      register: codeForm.register,
+      errors: codeForm.formState.errors,
+    },
+    isSubmitting:
+      emailForm.formState.isSubmitting || codeForm.formState.isSubmitting,
+    handleSubmit:
+      step === "email"
+        ? emailForm.handleSubmit(onSubmitEmail)
+        : codeForm.handleSubmit(onSubmitCode),
+    resend,
+    changeEmail,
+    finish,
   };
 }
-
-export type UseLoginFormReturn = ReturnType<typeof useLoginForm>;
